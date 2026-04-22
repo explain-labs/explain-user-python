@@ -17,11 +17,11 @@ sys.path.insert(0, str(HERE))
 
 from explain import Engine  # noqa: E402
 
-SCENARIO = HERE / "model_definitions" / "adult_female.json"
+SCENARIO = HERE / "model_definitions" / "term_neonate.json"
 CSV_OUT = HERE / "output" / "adult_female_python.csv"
 
 # Start small — 5 seconds of simulated time. Expand once it works.
-DURATION_S = 15.0
+DURATION_S = 30.0
 SAMPLE_EVERY_S = 0.01
 
 # A focused watchlist — enough to see physiology, not so many columns that

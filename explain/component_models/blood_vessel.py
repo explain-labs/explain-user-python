@@ -7,25 +7,29 @@ names `f"{input_name}_{self.name}"` and are inserted into the engine's
 
 The BloodVessel extends the usual factor-tier system with:
   - Resistance factors (r_factor, r_k_factor) and their _ps / _scaling_ps
-    tiers, matching what Resistor does.
-  - `alpha` (resistance-elastance coupling, unitless 0-1) that couples every
-    resistance factor back onto elastance as `pow(factor, alpha)`. Tissue
-    defaults: veins/venules 0.75, arterioles 0.63, large arteries 0.5.
-  - ANS modulation via `ans_activity` and `ans_sens`, applied to BOTH
-    resistance and elastance. The elastance path uses `pow(ans_activity,
-    alpha)`, so the same ANS signal moves both in coupled fashion.
+    tiers, composed MULTIPLICATIVELY (a product of all multipliers), so that
+    simultaneous factors compound correctly: r_factor=2 with r_factor_ps=2
+    yields 4x, not the linearised 3x of an additive scheme.
+  - `alpha` (resistance-elastance coupling, unitless 0-1) applied ONCE to
+    the combined resistance multiplier — `pow(_r_total_factor, alpha)` —
+    rather than per-factor. Tissue defaults: veins/venules 0.75,
+    arterioles 0.63, large arteries 0.5.
+  - ANS modulation via `ans_activity` and `ans_sens`. The per-vessel
+    sensitivity-weighted multiplier `1 + (ans_activity - 1) * ans_sens` is
+    folded into `_r_total_factor`, so a single ANS signal drives both
+    resistance and (via α) elastance in coupled fashion. There is NO
+    separate ANS term added to elastance — it's already absorbed by the
+    geometric coupling.
 
 `calc_model` is a custom dispatch: calc_resistances → calc_elastances →
 propagate effective values (and enabled / gates / external pressures) to
 every child resistor → calc_volumes → calc_pressure → get_flows.
 
-Faithfulness note on the JS formula order:
-`calc_resistances` resets `r_factor` and `r_k_factor` to 1.0 BEFORE
-`calc_elastances` runs, which means the non-persistent `_r_elas_factor`
-term in `calc_elastances` is always 1.0 → contributes 0 to `el_eff`. The
-persistent and scaling resistance-elastance couplings still work as
-intended. This appears to be a JS sequencing bug, but we preserve it
-verbatim for bit-identical parity; it is NOT fixed here.
+`calc_resistances` caches the composed linear-resistance multiplier on
+`self._r_total_factor`; `calc_elastances` consumes it as the single source
+of truth for the α-coupling. `r_k` carries its own factor stack with the
+same ANS coupling but is NOT α-coupled onto elastance (treated as a
+structural wall property, not a vasoactive one).
 
 `get_flows` reads each child resistor's `flow` attribute. Because the
 engine steps models in insertion order and child resistors are appended
@@ -114,6 +118,10 @@ class BloodVessel(BloodCapacitance):
         # internal dict of child resistors, keyed by f"{input_name}_{self.name}"
         self._resistors: dict = {}
 
+        # composed multiplicative R multiplier, cached by calc_resistances and
+        # reused by calc_elastances for the α-coupling
+        self._r_total_factor = 1.0
+
     def init_model(self, args):
         # apply JSON args and instantiate `components` sub-models (Capacitance path)
         super().init_model(args)
@@ -192,64 +200,66 @@ class BloodVessel(BloodCapacitance):
         self.flow = self.flow_forward - self.flow_backward
 
     def calc_resistances(self):
-        # ANS-modulated resistance. The ANS term is ADDED to every r_*_eff
-        # (vasoconstriction increases resistance when ans_activity > 1).
-        self.r_for_eff = (
-            self.r_for
-            + (self.r_factor - 1) * self.r_for
-            + (self.r_factor_ps - 1) * self.r_for
-            + (self.r_factor_scaling_ps - 1) * self.r_for
-            + (self.ans_activity - 1) * self.r_for * self.ans_sens
+        # Multiplicative composition of all resistance multipliers. Composing
+        # factors as a product (rather than summing their deltas) lets
+        # simultaneous factors compound correctly: r_factor=2 with
+        # r_factor_ps=2 gives a true 4x rise, not the linearised 3x. The ANS
+        # contribution is the per-vessel sensitivity-weighted multiplier
+        # (1 + (a-1)*ans_sens).
+        ans_mult = 1 + (self.ans_activity - 1) * self.ans_sens
+
+        r_total_factor = (
+            self.r_factor
+            * self.r_factor_ps
+            * self.r_factor_scaling_ps
+            * ans_mult
         )
-        self.r_back_eff = (
-            self.r_back
-            + (self.r_factor - 1) * self.r_back
-            + (self.r_factor_ps - 1) * self.r_back
-            + (self.r_factor_scaling_ps - 1) * self.r_back
-            + (self.ans_activity - 1) * self.r_back * self.ans_sens
+
+        self.r_for_eff = self.r_for * r_total_factor
+        self.r_back_eff = self.r_back * r_total_factor
+
+        # r_k carries its own factor stack but the same ANS coupling.
+        r_k_total_factor = (
+            self.r_k_factor
+            * self.r_k_factor_ps
+            * self.r_k_factor_scaling_ps
+            * ans_mult
         )
-        self.r_k_eff = (
-            self.r_k
-            + (self.r_k_factor - 1) * self.r_k
-            + (self.r_k_factor_ps - 1) * self.r_k
-            + (self.r_k_factor_scaling_ps - 1) * self.r_k
-            + (self.ans_activity - 1) * self.r_k * self.ans_sens
-        )
+        self.r_k_eff = self.r_k * r_k_total_factor
+
+        # Cache the composed linear-resistance multiplier for the elastance
+        # step (single source of truth for the α-coupling).
+        self._r_total_factor = r_total_factor
 
         # reset non-persistent factors
         self.r_factor = 1.0
         self.r_k_factor = 1.0
 
     def calc_elastances(self):
-        # Resistance-elastance coupling via `alpha`. Every resistance factor
-        # is raised to `alpha` and applied back onto elastance.
-        #
-        # Faithfulness note: the non-persistent `_r_elas_factor` reads
-        # `self.r_factor` AFTER `calc_resistances` reset it to 1.0, so it
-        # always equals `pow(1.0, alpha) = 1.0`. Its contribution to `el_eff`
-        # is therefore always 0 — a JS sequencing bug preserved verbatim.
-        _ans_elas_factor = self.ans_activity ** self.alpha
-        _r_elas_factor = self.r_factor ** self.alpha             # always 1.0 (see above)
-        _r_ps_elas_factor = self.r_factor_ps ** self.alpha
-        _r_scaling_elas_factor = self.r_factor_scaling_ps ** self.alpha
-
-        self.el_eff = (
-            self.el_base
-            + (self.el_base_factor - 1) * self.el_base
-            + (self.el_base_factor_ps - 1) * self.el_base
-            + (self.el_base_factor_scaling_ps - 1) * self.el_base
-            + (_r_elas_factor - 1) * self.el_base
-            + (_r_ps_elas_factor - 1) * self.el_base
-            + (_r_scaling_elas_factor - 1) * self.el_base
-            + (_ans_elas_factor - 1) * self.el_base * self.ans_sens
+        # Multiplicative composition of the passive elastance multipliers
+        # (aging, scaling, scenario edits — direct E modifiers, not R-coupled).
+        el_passive_mult = (
+            self.el_base_factor
+            * self.el_base_factor_ps
+            * self.el_base_factor_scaling_ps
         )
 
-        self.el_k_eff = (
-            self.el_k
-            + (self.el_k_factor - 1) * self.el_k
-            + (self.el_k_factor_ps - 1) * self.el_k
-            + (self.el_k_factor_scaling_ps - 1) * self.el_k
+        # Geometric R→E coupling: apply α once to the *combined* resistance
+        # multiplier, not per-factor. The ANS signal is already folded into
+        # _r_total_factor, so there is no separate ANS term here.
+        el_geom_mult = self._r_total_factor ** self.alpha
+
+        self.el_eff = self.el_base * el_passive_mult * el_geom_mult
+
+        # el_k carries its own multipliers and is NOT α-coupled to R — the
+        # non-linear stiffening term is treated as a structural property of
+        # the wall, not driven by vasoactivity.
+        el_k_passive_mult = (
+            self.el_k_factor
+            * self.el_k_factor_ps
+            * self.el_k_factor_scaling_ps
         )
+        self.el_k_eff = self.el_k * el_k_passive_mult
 
         # reset non-persistent factors
         self.el_base_factor = 1.0
